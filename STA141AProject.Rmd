@@ -1,0 +1,510 @@
+---
+title: "Sta141a project"
+output: html_document
+date: "2024-02-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+**Abstract**
+
+Predicting animal behavior through insights into neural patterns is a challenge due to our limited understanding of animal brains. Certain animals are often categorized as "dumb" or "smart," but what defines these terms and how do external factors influence such perceptions? Luca Mazzucato from the University of Oregon has recently made strides in deciphering the behavioral language of mice, revealing how sequences of neural activities can alter their behavioral tendencies in the paper *Metastable attractors explain the variable timing of stable behavioral action sequences*. From a subset of data from Steinmetz et al. (2019), we aim to forecast whether mice will fail or succeed in specific trial subsets. Our findings reveal that the process of predicting the behaviors of animals is difficult, but achievable given enough resources.
+
+**Introduction**
+
+In this report, we aim to construct a prediction model using a subset of data extracted from the study titled *Distributed coding of choice, action, and engagement across the mouse brain* by Steinmetz et al. Our objective is to forecast the success or failure of trials where mice were exposed to varying levels of contrast in each eye (0, 0.25, 0.5, 1). During these trials, mice were rewarded if they spun a wheel towards the direction of greater contrast, received no direction if both contrasts were 0, or were assigned a random direction if both contrasts were equal and above 0. The experiment was comprised of 18 sessions with varying numbers of trials conducted across four different mice. Neural activity in the visual cortex was recorded during these trials, captured as spike trains at specific time intervals. Utilizing these parameters, our goal is to predict whether the mice achieved success or experienced failure in a given trial. We expect slight improvements over the naive model (where all trials are assumed successful) because there is inherent challenge in accurately predicting animal behavior.
+
+
+**Exploratory Data Analysis**
+```{r,echo=FALSE}
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('./Data/session',i,'.rds',sep=''))
+  }
+```
+  
+```{r,echo=FALSE}
+stimuli_vals_L <- c()
+stimuli_vals_R <- c()
+feedback_vals <- c()
+
+for (i in 1:18) {
+  for (j in 1:length(session[[i]]$contrast_left)) {
+    stimuli_vals_L <- c(stimuli_vals_L, session[[i]]$contrast_left[j])
+    stimuli_vals_R <- c(stimuli_vals_R, session[[i]]$contrast_right[j])
+    feedback_vals <- c(feedback_vals, session[[i]]$feedback_type[j])
+  }
+}
+result_sections_L <- cut(stimuli_vals_L, breaks = c(-Inf, 0, 0.25, 0.5, 1), labels = FALSE)
+result_sections_R <- cut(stimuli_vals_R, breaks = c(-Inf, 0, 0.25, 0.5, 1), labels = FALSE)
+data <- data.frame(result_section_L = result_sections_L,
+                   result_section_R = result_sections_R,
+                   fed_vals = feedback_vals)
+mean_table <- aggregate(fed_vals ~ result_section_L + result_section_R, data, mean)
+mean_matrix <- reshape(mean_table, idvar = "result_section_L", timevar = "result_section_R", direction = "wide")
+mean_matrix <- mean_matrix[, -1 ]
+new_section_labels <- c("0", "0.25", "0.5", "1")
+new_row_labels <- paste("Left:", new_section_labels)
+new_col_labels <- paste("Right:", new_section_labels)
+colnames(mean_matrix) <- new_col_labels
+rownames(mean_matrix) <- new_row_labels
+mean_matrix_numeric <- as.matrix(mean_matrix)
+mean_matrix_numeric
+    
+
+```
+
+
+```{r,echo=FALSE}
+my_palette <- colorRampPalette(c("blue", "white", "red"))(100)
+heatmap(mean_matrix_numeric, col = my_palette,  scale = "none",  main = "Contrast Heatmap for Success Rates",  xlab = "Right",  ylab = "Left", Rowv = NA, Colv = NA)
+axis(1, at=1:ncol(mean_matrix_numeric), labels=colnames(mean_matrix_numeric), las=2)
+axis(2, at=1:nrow(mean_matrix_numeric), labels=rownames(mean_matrix_numeric))
+par(mar = c(5, 6, 4, 2) + 0.1)
+```
+
+When comparing trial success rates across different combinations of feedback levels, the likelihood of success decreases when the feedback levels are similar and increases when there's a greater disparity between them. This observation is supported by the heatmap, where the diagonal from bottom-left to top-right shows low values, indicating lower success rates when feedback levels are similar, while the top-left and bottom-right corners show high values (depicted as red), suggesting higher success rates when feedback levels differ significantly. It's notable that the best predictor for success was when one feedback value was 0, rather than when one was equal to 1. Mice exhibited better performance in trials with absence of stimulation compared to those with full stimulation. This indicates that the absence of stimulation was better for trial success. The difference in contrast has a large effect on our success rate.
+
+
+```{r,echo=FALSE, message=FALSE}
+library(ggplot2)
+library(readr)
+library(tidyverse)
+library(knitr)
+library(dplyr)
+library(ggcorrplot)
+library(zoo)
+library(glmnet)
+library(caret)
+library(dplyr)
+```
+
+
+
+```{r,echo=FALSE, message=FALSE}
+n.session <- 18
+meta <- tibble(
+  mouse_name = rep('name',n.session),
+  date_exp =rep('dt',n.session),
+  n_brain_area = rep(0,n.session),
+  n_neurons = rep(0,n.session),
+  n_trials = rep(0,n.session),
+  success_rate = rep(0,n.session)
+)
+
+for(i in 1:18){
+  tmp = session[[i]];
+  meta[i,1]=tmp$mouse_name;
+  meta[i,2]=tmp$date_exp;
+  meta[i,3]=length(unique(tmp$brain_area));
+  meta[i,4]=dim(tmp$spks[[1]])[1];
+  meta[i,5]=length(tmp$feedback_type);
+  meta[i,6]=mean(tmp$feedback_type+1)/2;
+}
+meta$successes <-  meta$n_trials*meta$success_rate
+meta_factors <- meta %>%
+  group_by(mouse_name) %>%
+  summarise(across(-c(date_exp, success_rate), mean))
+meta_factors$adj_suc_rate <- meta_factors$successes/meta_factors$n_trials
+print(meta_factors)
+
+```
+
+Clear differences among mice are evident in terms of success rate and trial design. Cori ranks lower in terms of average brain areas analyzed, total neurons examined, and total trials per session compared to Hench, who ranks higher in these aspects. There are great differences in performance among the mice. Cori exhibits a surprisingly low success rate in trials (64%), while Forsmann and Hench perform at a mediocre level (around 68%). In contrast, Lederberg outperforms the others with a notably higher success rate (76%). The differences in performance could stem from various factors. Different mice could be inherently better at the experiment or there could be differences in the experimental design as it evolved over time. Further investigation would be necessary to understand the reasons behind these discrepancies among mice.
+
+```{r,echo=FALSE}
+trials <- c(1:18)
+craz <- lm(meta$success_rate ~ trials)
+plot(meta$success_rate ~ trials, xlab = "Session Number", ylab = "Sucess Rate Within Trials")
+abline(craz)
+maze <- lm(meta$success_rate ~ meta$n_trials)
+plot(meta$success_rate ~ meta$n_trials, xlab = "Number of Trials Per Session", ylab = "Sucess Rate Within Trials")
+abline(maze)
+sum_craz <- summary(craz)
+print("Linear Model Success Rate vs Session")
+if(length(sum_craz$coefficients) > 0) {
+  print(sum_craz$coefficients)
+}
+sum_maze <- summary(maze)
+print("Linear Model Success Rate vs Number of Trials")
+if(length(sum_maze$coefficients) > 0) {
+  print(sum_maze$coefficients)
+}
+
+
+```
+
+As the experiment progressed, we observed higher success rates from session to session, indicating an overall improvement over time. However, this improvement wasn't consistently reflected on a trial-to-trial basis within each session. This discrepancy could be attributed to improvements in the experimental design over time and/or potential learning of the mice throughout the experiment. It's important to know that any observed improvements in performance were primarily between sessions rather than within individual sessions. Increasing the number of trials within a given session did not result in enhancements in individual performance. This suggests that the mice didn't exhibit improvement between trials within a session, indicating that any potential improvement would occur over longer periods, possibly after extended rest periods.
+
+```{r,echo=FALSE}
+num_spks_freq <- list()
+for (i in 1:18) {
+  for (j in 1:length(session[[i]]$feedback_type)) {
+    num_spks_freq <- c(num_spks_freq, mean(session[[i]]$spks[[j]]))
+  }
+}
+sd_value <- sd(unlist(num_spks_freq))
+mean_value <- mean(unlist(num_spks_freq))
+print(paste("standard deviation of spike rate =", sd_value))
+print(paste("mean spike rate =", mean_value))
+hist(unlist(num_spks_freq), breaks = 20, main = "Distribution of Mean Neuron Spikes Per Trial", xlab = "Mean Value")
+qqnorm(unlist(num_spks_freq))
+qqline(unlist(num_spks_freq))
+```
+
+
+On average, approximately 3.42 percent of time stamps exhibit neuron spikes in any given trial, with a standard deviation of 1.23 percent. We cannot assert that our values follow a normal distribution, as our QQ plot indicates a skewed distribution. Although not perfect, a skewed distribution aligns with the fact that the mean is less than three standard deviations away from 0(the minimum). Given that there are no significant outliers within our dataset, we can reasonably conclude that approximately between 1.5 percent and 6 percent of time stamps will display neuron spikes for the majority of trials.
+
+
+```{r,echo=FALSE}
+num_spks_freq <- list()
+for (i in 1:18) {
+  for (j in 1:length(session[[i]]$feedback_type)) {
+    num_spks_freq <- c(num_spks_freq, mean(session[[i]]$spks[[j]]))
+  }
+}
+
+num_con_L <- list()
+for (i in 1:18) {
+  for (j in 1:length(session[[i]]$contrast_left)) {
+    num_con_L <- c(num_con_L, mean(session[[i]]$contrast_left[[j]]))
+  }
+}
+result <- unlist(num_con_L)
+new <- unlist(num_spks_freq)
+new_0 <- new[result == 0]
+new_025 <- new[result == 0.25]
+new_05 <- new[result == 0.5]
+new_1 <- new[result == 1]
+par(mfrow=c(2,2), mar=c(2,2,1,1))
+hist(new_0, main="Contrast Left vs spike rate(contrast = 0)", xlab="spike rate")
+hist(new_025, main="Contrast Left vs spike rate(contrast = 0.25)", xlab="spike rate", )
+hist(new_05, main="Contrast Left vs spike rate(contrast = 0.5)", xlab="spike rate")
+hist(new_1, main="Contrast Left vs spike rate(contrast = 1)", xlab="spike rate")
+```
+
+```{r,echo=FALSE}
+num_con_R <- list()
+for (i in 1:18) {
+  for (j in 1:length(session[[i]]$contrast_right)) {
+    num_con_R <- c(num_con_R, mean(session[[i]]$contrast_right[[j]]))
+  }
+}
+resultR <- unlist(num_con_R)
+new_0R <- new[resultR == 0]
+new_025R <- new[resultR == 0.25]
+new_05R <- new[resultR == 0.5]
+new_1R <- new[resultR == 1]
+par(mfrow=c(2,2), mar=c(4,4,2,2)) 
+hist(new_0R, main="contrast Right vs spike rate (contrast =0)", xlab="spike rate")
+hist(new_025R, main="contrast Right vs spike rate (contrast =0.25)", xlab="spike rate")
+hist(new_05R, main="contrast Right vs spike rate(contrast = 0.5)", xlab="spike rate")
+hist(new_1R, main="contrast Right vs spike rate(contrast = 1)", xlab="spike rate")
+```
+
+It appears that the neuron spike hit rates on a trial basis show little to no variation across different types of contrast levels in the trial. The spike rates for both contrasts right and contrasts left resemble the overall spike rate graph previously presented. With a mean around 0.035, hit rates range between 0.01 and 0.07. This suggests that the differences in contrast have little to no impact on the operational pace of the visual cortex.
+
+```{r,echo=FALSE}
+Cori_spks_freq <- list()
+for (i in 1:3) {
+  for (j in 1:length(session[[i]]$feedback_type)) {
+    Cori_spks_freq <- c(Cori_spks_freq, mean(session[[i]]$spks[[j]]))
+  }
+}
+Fors_spks_freq <- list()
+for (i in 4:7) {
+  for (j in 1:length(session[[i]]$feedback_type)) {
+    Fors_spks_freq <- c(Fors_spks_freq, mean(session[[i]]$spks[[j]]))
+  }
+}
+Hen_spks_freq <- list()
+for (i in 8:11) {
+  for (j in 1:length(session[[i]]$feedback_type)) {
+    Hen_spks_freq <- c(Hen_spks_freq, mean(session[[i]]$spks[[j]]))
+  }
+}
+Led_spks_freq <- list()
+for (i in 12:18) {
+  for (j in 1:length(session[[i]]$feedback_type)) {
+    Led_spks_freq <- c(Led_spks_freq, mean(session[[i]]$spks[[j]]))
+  }
+}
+Cori_spks_freq <- unlist(Cori_spks_freq)
+Fors_spks_freq <- unlist(Fors_spks_freq)
+Hen_spks_freq <- unlist(Hen_spks_freq)
+Led_spks_freq <- unlist(Led_spks_freq)
+means <- c(mean(Cori_spks_freq), mean(Fors_spks_freq), mean(Hen_spks_freq), mean(Led_spks_freq))
+sds <- c(sd(Cori_spks_freq), sd(Fors_spks_freq), sd(Hen_spks_freq), sd(Led_spks_freq))
+result_table <- data.frame(List = c("Cori", "Fors", "Hen", "Led"), Mean = means, Standard_Deviation = sds)
+par(mfrow=c(2,2), mar=c(2,2,1,1))
+result_table
+hist(Cori_spks_freq, main ="Cori spike rate")
+hist(Fors_spks_freq, main ="Forssman spike rate")
+hist(Hen_spks_freq, main ="Hench spike rate")
+hist(Led_spks_freq, main ="Lederberg spike rate")
+
+```
+
+It appears that different mice exhibit varying neuron spike rates in trials when presented with contrasts. Specifically, Cori's visual cortex displays significantly higher activity (4.22%) compared to others such as Forssman (2.49%), who demonstrates nearly half the visual cortex activity of Cori. Hench (3.47%) and Lederberg (3.63%) fall in between these extremes. Cori and Lederberg, the top two mice in terms of visual cortex activity, exhibit slightly bimodal distributions, explaining the higher standard deviations observed in their trial to trial spike rate.
+
+```{r,echo=FALSE}
+num_spks_freq <- c()
+feedback_vals <- c()
+
+for (i in 1:18) {
+  for (j in 1:length(session[[i]]$feedback_type)) {
+    num_spks_freq <- c(num_spks_freq, mean(session[[i]]$spks[[j]]))
+    feedback_vals <- c(feedback_vals, session[[i]]$feedback_type[j])
+  }
+}
+data <- data.frame(num_spks_freq, feedback_vals)
+t.test(num_spks_freq ~ feedback_vals, data = data)
+
+```
+
+There is a direct relationship between increased neuron spikes in the brain and trial success or failure. On average, successful trials exhibit 0.3% more brain spikes compared to failed trials. This finding suggests that a more active visual cortex is associated with a higher likelihood of correctly responding to the trial. Brain activity will be a primary part of our prediction model.
+
+*Conclusions:*
+
+1. Mouse Type
+
+a. Cori: Despite having the lowest success rate, Cori exhibited the highest spike rate, indicating a very active visual cortex.
+
+b. Forsmann: With an average success rate and a low spike rate, Forsmann has a simple yet effective visual cortex.
+
+c. Hench: Showing average performance in both categories, Hench's cortex appeared to be average in activity.
+
+d. Lederberg: Lederberg demonstrated high success rates along with the second-highest spike rate, suggesting high visual intelligence. His success rate could be influenced by the significantly larger number of sessions compared to other mice.
+
+These trends provide insights into how the brains of each mouse function in response to various stimuli.
+
+2. Contrasts Left and Right
+
+There was no apparent relationship between contrast levels and average brain spikes in a given mouse. However, their combinations directly affected trial success rates. Equal contrast levels resulted in low success probabilities, while larger differences, especially when one contrast was 0, led to higher accuracy.
+
+3. Spikes
+
+3.5% of time stamps were associated with neuron spikes in each trial. While there was no relationship between contrast levels and visual cortex activity, certain mice showed more active visual cortexes, affecting spike rates. Successful trials tended to have higher spike rates compared to failures.
+
+4. Feedback Type (Success Rate)
+
+On a session-by-session basis, certain mice demonstrated higher success rates compared to others, and overall, results tended to improve from session to session. On a trial-by-trial basis, the combination of contrast levels and spike rates directly influenced the likelihood of trial success or failure.
+
+  
+
+**Data Integration**
+
+Now we create a data frame from which we can operate keeping in mind the trends we have noticed throughout the previous section. Some of our predictors of whether or not our values would result in success is the difference in contrast levels. In addition, it seems as though the type of mouse had an effect on success rates. We will also take into account the average spikes per neuron in any given trial as a possibly important factor for success or failure. 
+
+
+```{r,echo=FALSE}
+ave_spks_trial <- c()
+for (i in 1:18) {
+  for (j in 1:length(session[[i]]$spks)) {
+    spks_trial <- session[[i]]$spks[[j]]
+    total_spikes <- apply(spks_trial, 1, sum)
+    ave_spks_trial <- c(ave_spks_trial, mean(total_spikes))
+  }
+}
+
+all_mouse_names <- c()
+for (i in 1:18) {
+  for (j in 1:length(session[[i]]$spks)) {
+    all_mouse_names <- c(all_mouse_names, session[[i]]$mouse_name[j])
+  }
+}
+sessionID <- c()
+trialID <- c()
+for (i in 1:18) {
+  for (j in 1:length(session[[i]]$spks)) {
+    sessionID <- c(sessionID, i)
+    trialID <- c(trialID, j)
+  }
+}
+dif_cont <- abs(stimuli_vals_L-stimuli_vals_R)
+```
+
+
+```{r,echo=FALSE}
+data <- data.frame(
+  sessionID = sessionID,      
+  trialID = trialID,    
+  mouse_names = all_mouse_names,
+  ave_spks_trial = ave_spks_trial,
+  feedback_vals = feedback_vals, 
+  stimuli_vals_R = stimuli_vals_R ,
+  stimuli_vals_L = stimuli_vals_L,
+  dif_cont = dif_cont
+)
+
+data$mouse_names <- na.locf(data$mouse_names)
+
+head(data)
+```
+We have now created a dataframe that contains many important values in our dataset for each trial along with certain factors that have been added. For example, the average spikes that occur in a neuron per trial and the difference in contrasts.
+
+```{r,echo=FALSE}
+data$feedback_vals[data$feedback_vals == -1] <- 0
+model <- glm(feedback_vals ~ dif_cont + mouse_names + ave_spks_trial, data = data, family = binomial)
+summary(model)
+null_model <- glm(feedback_vals ~ 1, data = data, family = binomial)
+lrt <- anova(null_model, model, test = "LRT")
+lrt
+
+```
+
+In our logistic regression model, we observe that all factors derived from the exploratory analysis exhibit a logistic relationship with the feedback value from a given trial, evidenced by their low p-values. To reinforce this, we build a model and compare its errors (ANOVA) with those of a simpler model. Model 2 has a better fit over Model 1, shown by a small p-value (p < 2.2e-16). The inclusion of difference in contrasts, mouse names, and average spikes per trial leads to a substantial reduction in deviance (211.17) compared to the null model. Introducing these elements into our dataset will improve the predictability of our trial outcomes.
+
+
+**Model Training and Prediction**
+
+*Model Selection*
+
+In our prediction, we will be using logistic regression because the data we are attempting to predict is binary(it is either a failure or a success). Logistic regression will help us determine the probability of an event being a success or a failure. Our goal is to develop a prediction model for trials 1 and 18, so we'll isolate them from the rest of the dataset. To accomplish this, we'll create separate test and train datasets to properly build the model.
+
+```{r,echo=FALSE}
+set.seed(101)
+subset_data <- data[data$sessionID %in% c(1, 18), ]
+n_obs <- nrow(subset_data)
+sample <- sample.int(n = n_obs, size = floor(.8 * n_obs), replace = FALSE)
+train_data <- subset_data[sample, ]
+test_data <- subset_data[-sample, ]
+```
+
+```{r,echo=FALSE}
+tot_log_model <- glm(feedback_vals ~ dif_cont + mouse_names + ave_spks_trial + sessionID + trialID + stimuli_vals_L + stimuli_vals_R, data = train_data, family = binomial)
+plot(jitter(tot_log_model$y)~tot_log_model$fitted.values,pch=12,xlab="Fitted values", ylab="Success Rate (jittered)")
+```
+
+We start off by creating a logistic model for the model that contains all eligible factors in our data frame. We will consider this the full model and will be working off of this. We have to investigate other models to see if they might result in better prediction models. One of the ways to do this is to analyze their AIC and BIC.
+
+```{r,echo=FALSE}
+data$feedback_vals[data$feedback_vals == -1] <- 0
+model_new_factors <- glm(feedback_vals ~ dif_cont + mouse_names + ave_spks_trial, data = train_data, family = binomial)
+tot_log_model <- glm(feedback_vals ~ dif_cont + mouse_names + ave_spks_trial + trialID + sessionID + stimuli_vals_L + stimuli_vals_R, data = train_data, family = binomial)
+model_no_stim <- glm(feedback_vals ~ dif_cont + mouse_names + ave_spks_trial + sessionID, data = train_data, family = binomial)
+model_no_sesh <- glm(feedback_vals ~ dif_cont + mouse_names + stimuli_vals_L + stimuli_vals_R, data = train_data, family = binomial)
+model_no_sesh_stim_names <- glm(feedback_vals ~ dif_cont + ave_spks_trial, data = train_data, family = binomial)
+model_no_rate <- glm(feedback_vals ~ dif_cont + mouse_names + sessionID + stimuli_vals_L + stimuli_vals_R, data = train_data, family = binomial)
+model_no_dif <- glm(feedback_vals ~ mouse_names + ave_spks_trial + sessionID + stimuli_vals_L + stimuli_vals_R, data = train_data, family = binomial)
+model_no_names <- glm(feedback_vals ~ dif_cont + ave_spks_trial + sessionID + stimuli_vals_L + stimuli_vals_R, data = train_data, family = binomial)
+aic <- c(AIC(model_new_factors), AIC(tot_log_model), AIC(model_no_stim), AIC(model_no_sesh), AIC(model_no_sesh_stim_names), AIC(model_no_rate), AIC(model_no_dif), AIC(model_no_names))
+bic <- c(BIC(model_new_factors), BIC(tot_log_model), BIC(model_no_stim), BIC(model_no_sesh), BIC(model_no_sesh_stim_names), BIC(model_no_rate), BIC(model_no_dif), BIC(model_no_names))
+model_names <- c("model_new_factors", "tot_log_model", "model_no_stim", "model_no_sesh", "model_no_sesh_stim_names", "model_no_rate", "model_no_dif", "model_no_names")
+best_model_aic <- which.min(aic)
+best_model_bic <- which.min(bic)
+model_results <- data.frame(
+  Model = model_names,
+  AIC = aic,
+  BIC = bic
+)
+print(model_results)
+print(paste("Best AIC model:", model_names[best_model_aic]))
+print(paste("Best BIC model:", model_names[best_model_bic]))
+```
+
+Using AIC and BIC for model selection to assess both the error reduction and model simplicity for eligible models gives us no information. The values obtained from both criteria are relatively similar, and there is disagreement between AIC and BIC regarding the best model. While the total model performs best according to AIC, it exhibits a higher BIC. The model excluding stimulations demonstrates superior BIC. Instead, we will use lasso cross-validation to select our model for predicting sessions 1 and 18.
+
+```{r,echo=FALSE, message=FALSE}
+train_data <- na.omit(train_data)
+predictors <- names(train_data)[names(train_data) != "feedback_vals"]
+cross_Valid <- cv.glmnet(x = as.matrix(train_data[, predictors]), y = train_data$feedback_vals, alpha = 1, nfolds = 10)
+plot(cross_Valid)
+coef(cross_Valid, s = "lambda.min")
+```
+Through lasso cross validation, we discover that our best model has all of our variables except for mouse names. As one can see in this plot, there is minimal mean squared error when the top bar is equal to 6, meaning that our best model has 6 total coefficients. The second matrix displays coefficients for all other factors except for mouse_names have. All values with coefficients should be included in our model. I initially highlighted the importance of mouse names in our prediction model, yet we've chosen to exclude it. We are eliminating mouse_names in this case because we are only looking to predict results from 2 sessions, one with Cory and the other with Lederberg. Therefore, mouse_names and sessionID are identical and introducing both of them would be unnecessary. If we were looking to predict general trials from the whole experiment, mouse_names would be an extremely important factor, but in this case it is not.
+
+*Building a Predictive Model*
+
+Now that we have the 6 factors that will go into our final model from model selection, we must now build our predictive model. This will be made from logistic regression because our feedback values are binary. We will be using TrialID, SessionID, difference in contrast, average spikes per trial, and stimuli values left and right to determine the success or failure of any given trial.
+
+```{r,echo=FALSE}
+tot_log_model <- glm(feedback_vals ~ dif_cont + trialID + ave_spks_trial + sessionID + stimuli_vals_L + stimuli_vals_R, data = train_data, family = binomial)
+final_prediction_mod <- predict(tot_log_model, newdata = subset(test_data, select = -feedback_vals), type = 'response')
+pred_tot <- factor(final_prediction_mod > 0.5, labels = c('0', '1'))
+pred_tot <- factor(pred_tot, levels = c('0', '1'))
+test_data$feedback_vals <- factor(test_data$feedback_vals, levels = c('0', '1'))
+mean(pred_tot != test_data$feedback_vals)
+conf_tot <- confusionMatrix(pred_tot, test_data$feedback_vals, dnn = c("Prediction", "Reference"))
+plt <- as.data.frame(conf_tot$table)
+ggplot(plt, aes(Reference, Prediction, fill = Freq)) +
+  geom_tile() + geom_text(aes(label = Freq)) +scale_fill_gradient(low = "white", high = "#009194")+ labs(x = "Reference", y = "Prediction") + scale_x_discrete(labels = c("failure", "success")) + scale_y_discrete(labels = c("failure", "success"))
+```
+
+The estimated prediction error for our prediction model across sessions 1 through 18 is approximately 18%, so our prediction model has 82% accuracy. The majority of our prediction errors stem from false positives, with 75% of our misses being predicted as false positives. Comparatively, our prediction model outperforms the naive approach of predicting all values as successes, given that 72% of trials are successful. Our model achieves a 10% improvement over this baseline, which is adequate, but has room for improvement.
+
+**Performance Upon the Test Sets**
+
+We create a function that allows us to insert the supplied trials from session 1 and 18 into our prediction model to determine the success or failure. We must recreate our dataframe with the factors in the model we selected for our logistic regression.
+
+
+```{r,echo=FALSE}
+tester <- list()
+for(i in 1:2) {
+  tester[[i]] <- readRDS(paste('test', i, '.rds', sep=''))
+}
+test_stimuli_vals_L <- c()
+test_stimuli_vals_R <- c()
+test_feedback_vals <- c()
+for (i in 1:2) {
+  for (j in 1:length(tester[[i]]$contrast_left)) {
+    test_stimuli_vals_L <- c(test_stimuli_vals_L, tester[[i]]$contrast_left[j])
+    test_stimuli_vals_R <- c(test_stimuli_vals_R, tester[[i]]$contrast_right[j])
+    test_feedback_vals <- c(test_feedback_vals, tester[[i]]$feedback_type[j])
+  }
+}
+test_dif_cont <- abs(test_stimuli_vals_L-test_stimuli_vals_R)
+test_ave_spks_trial <- c()
+for (i in 1:2) {
+  for (j in 1:length(tester[[i]]$spks)) {
+    test_spks_trial <- tester[[i]]$spks[[j]]
+    test_total_spikes <- apply(test_spks_trial, 1, sum)
+    test_ave_spks_trial <- c(test_ave_spks_trial, mean(test_total_spikes))
+  }
+}
+test_sessionID <- c()
+test_trialID <- c()
+for (i in 1:2) {
+  for (j in 1:length(tester[[i]]$spks)) {
+    test_sessionID <- c(test_sessionID, i)
+    test_trialID <- c(test_trialID, j)
+  }
+}
+test_data_frame <- data.frame(
+  test_sessionID = test_sessionID,      
+  test_trialID = test_trialID,    
+  test_ave_spks_trial = test_ave_spks_trial,
+  test_feedback_vals = test_feedback_vals, 
+  test_stimuli_vals_R = test_stimuli_vals_R ,
+  test_stimuli_vals_L = test_stimuli_vals_L,
+  test_dif_cont = test_dif_cont
+)
+head(test_data_frame)
+
+```
+
+We have created a dataframe from our test data and we will now plug this into our prediction model. 
+
+```{r,echo=FALSE}
+test_data_frame$test_feedback_vals[test_data_frame$test_feedback_vals == -1] <- 0
+test_log_model <- glm(test_feedback_vals ~ test_dif_cont + test_trialID + test_ave_spks_trial + test_sessionID + test_stimuli_vals_L + test_stimuli_vals_R, data = test_data_frame, family = binomial)
+test_final_prediction_mod <- predict(test_log_model, newdata = subset(test_data_frame, select = -test_feedback_vals), type = 'response')
+test_pred_tot <- factor(test_final_prediction_mod > 0.5, labels = c('0', '1'))
+test_pred_tot <- factor(test_pred_tot, levels = c('0', '1'))
+test_data_frame$test_feedback_vals <- factor(test_data_frame$test_feedback_vals, levels = c('0', '1'))
+mean(test_pred_tot != test_data_frame$test_feedback_vals)
+test_conf_tot <- confusionMatrix(test_pred_tot, test_data_frame$test_feedback_vals, dnn = c("Prediction", "Reference"))
+plt <- as.data.frame(test_conf_tot$table)
+ggplot(plt, aes(Reference, Prediction, fill = Freq)) +
+  geom_tile() + geom_text(aes(label = Freq)) +scale_fill_gradient(low = "white", high = "#009194")+ labs(x = "Reference", y = "Prediction") + scale_x_discrete(labels = c("failure", "success")) + scale_y_discrete(labels = c("failure", "success"))
+```
+
+Our prediction model exhibits poor performance on the provided test trials. It inaccurately predicts 28% of the trials, resulting in a low 72% accuracy. The majority of errors stem from false positives, consisting of almost a quarter of our predictions. Our model's performance is almost identical to the naive approach of predicting all trials as successes. Despite this, I believe our prediction model holds a slight edge over the naive model and is marginally better for general prediction. This model performed significantly worse than our initial model because it encountered challenges due to suboptimal data points and the inability to train to these data points.
+
+**Discussion**
+
+The initial hypothesis was confirmed: we were able to enhance prediction accuracy compared to a naive model, but the improvement wasn't substantial. On the bright side, we were able to include crucial additional factors like the difference in contrasts proved that significantly improved our model. On the downside, our model failed against the test data, as it is inherently flawed. Exploring additional factors beyond trials 1 and 18, especially the types of mice, could yield interesting insights and could allow us to patch up these holes in our model. Moving forward, understanding and analyzing other data collected from the experiment would be beneficial for gaining a fuller understanding of what causes failure versus success, which would improve our prediction model. More data could help us discover more patterns and relationships that lead to a more accurate prediction model. With more resources, data, and information one could easily create a better model.
+
+
